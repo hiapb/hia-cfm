@@ -28,71 +28,34 @@ get_workdir() {
     [[ -f "$ENV_RECORD_FILE" ]] && cat "$ENV_RECORD_FILE" || echo ""
 }
 
-inject_secure_credentials() {
-    local workdir=$1
-    local new_pass=$2
-    local new_key=$3
-    
-    info "启动智能嗅探，等待 system_configs 表完成实例化..."
-    local ready=0
-    # 智能轮询：最大等待 40 秒，一旦表创建立即突入
-    for i in {1..20}; do
-        docker exec -i cfm-client-mysql mysql -uroot -pcodefreemax kiro_client -e "SELECT 1 FROM system_configs LIMIT 1;" >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            ready=1
-            break
-        fi
-        sleep 2
-    done
-
-    if [ $ready -eq 0 ]; then
-        warn "引擎超时未检测到目标表，注入流熔断。请检视服务器 I/O 状态。"
-        return
-    fi
-
-    # 实施全覆盖型 SQL 注入，穿透底层 ORM 字段命名迷雾
-    docker exec -i cfm-client-mysql mysql -uroot -pcodefreemax kiro_client -e "
-        UPDATE system_configs SET value='${new_pass}' WHERE \`key\` IN ('admin_password', 'password');
-        UPDATE system_configs SET value='${new_key}' WHERE \`key\` IN ('system_api_key', 'api_key');
-        UPDATE system_configs SET \`value\`='${new_pass}' WHERE \`name\` IN ('admin_password', 'password');
-        UPDATE system_configs SET \`value\`='${new_key}' WHERE \`name\` IN ('system_api_key', 'api_key');
-    " > /dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
-        info "底层数据穿透成功：原始出厂硬编码已被安全密匙强制抹除。"
-    else
-        warn "数据库指令下发异常，核心主权未能完全接管。"
-    fi
-}
-
 show_credentials() {
     local workdir=$1
-    local config_file="${workdir}/config.yaml"
     local env_file="${workdir}/.env"
-    local sys_admin_pass=$(awk '/^admin:/{flag=1} flag && /password:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
-    local sys_api_key=$(awk '/^admin:/{flag=1} flag && /api_key:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
     local host_port=$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "8877")
     local server_ip=$(get_local_ip)
+    
     echo -e "\n=================================================="
-    echo -e "\033[32m✅ CodeFreeMax 实例就绪\033[0m"
+    echo -e "\033[32m✅ CodeFreeMax 实例部署就绪\033[0m"
     echo -e "控制面板: \033[36mhttp://${server_ip}:${host_port}\033[0m"
     echo -e "--------------------------------------------------"
-    echo -e "面板密码: \033[31m${sys_admin_pass}\033[0m"
-    echo -e "系统 API Key: \033[33m${sys_api_key}\033[0m"
+    echo -e "【系统出厂默认鉴权凭证】"
+    echo -e "默认面板密码: \033[31madmin123\033[0m"
+    echo -e "默认 API Key: \033[33msk-paas\033[0m"
     echo -e "--------------------------------------------------"
-    echo -e "⚠️ 系统已强制执行 SQL 注入，完成商业级安全防线闭环。"
+    echo -e "⚠️ 安全警示：出厂口令已锁定在数据库中。"
+    echo -e "⚠️ 登入后，请务必立即在【系统配置】修改您的密码与密钥！"
     echo -e "==================================================\n"
 }
 
 deploy_codefreemax() {
-    info "== 启动 CodeFreeMax 自动化部署编排 =="
+    info "== 启动 CodeFreeMax 极简部署编排 =="
     require_cmd docker
     require_cmd curl
-    require_cmd openssl
-    require_cmd awk
     local dc_cmd=$(docker_compose_cmd)
+    
     read -r -p "请输入安装路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
+    
     if [[ -d "$install_path" && "$(ls -A "$install_path" 2>/dev/null)" ]]; then
         err "该路径已存在部署实例或残留数据，请先执行 [8] 卸载。"
         return 
@@ -100,28 +63,23 @@ deploy_codefreemax() {
     mkdir -p "$install_path"
     echo "$install_path" > "$ENV_RECORD_FILE"
     cd "$install_path" || return
+    
     read -r -p "请输入对外访问端口 [默认: 8877]: " input_port
     local host_port=${input_port:-8877}
-    info "正在拉取核心拓扑文件..."
+    
+    info "正在拉取核心拓扑与配置..."
     curl -sSL "$COMPOSE_URL" -o docker-compose.yml || die "拓扑同步失败"
     curl -sSL "$CONFIG_URL" -o config.yaml || die "配置树同步失败"
-    local sys_pass=$(openssl rand -hex 6)
-    local sys_key="sk-cfm-$(openssl rand -hex 16)"
-    awk -v pw="${sys_pass}" -v ak="${sys_key}" '
-        /^admin:/ { in_admin=1; print; next }
-        /^[^ ]/ { in_admin=0 }
-        in_admin && /password:/ { sub(/password:.*/, "password: \"" pw "\""); print; next }
-        in_admin && /api_key:/ { sub(/api_key:.*/, "api_key: \"" ak "\""); print; next }
-        { print }
-    ' config.yaml > config.yaml.tmp && mv config.yaml.tmp config.yaml
+
     cat > .env <<EOF
 PORT=${host_port}
 TZ=Asia/Shanghai
 EOF
     mkdir -p data && chmod -R 777 data
-    info "正在拉起微服务矩阵..."
+    
+    info "正在拉起微服务矩阵 (初次运行需耗时建立数据库)..."
     $dc_cmd up -d || die "容器启动失败"
-    inject_secure_credentials "$install_path" "$sys_pass" "$sys_key"
+    
     show_credentials "$install_path"
 }
 
@@ -132,7 +90,7 @@ upgrade_service() {
     info "正在拉取最新镜像并重建容器..."
     $(docker_compose_cmd) pull
     $(docker_compose_cmd) up -d
-    show_credentials "$workdir"
+    info "更新完成。"
 }
 
 pause_service() {
@@ -147,10 +105,7 @@ restart_service() {
     [[ -z "$workdir" ]] && { err "未检测到部署环境。"; return; }
     cd "$workdir" || return
     $(docker_compose_cmd) restart
-    local sys_pass=$(awk '/^admin:/{flag=1} flag && /password:/{print $2; flag=0}' config.yaml | tr -d '"' | tr -d "'" | tr -d ' ')
-    local sys_key=$(awk '/^admin:/{flag=1} flag && /api_key:/{print $2; flag=0}' config.yaml | tr -d '"' | tr -d "'" | tr -d ' ')
-    inject_secure_credentials "$workdir" "$sys_pass" "$sys_key"
-    show_credentials "$workdir"
+    info "服务已重启。"
 }
 
 do_backup() {
@@ -182,7 +137,7 @@ restore_backup() {
     mkdir -p "$wd" && tar -xzf "$path" -C "$wd"
     echo "$wd" > "$ENV_RECORD_FILE"
     cd "$wd" && chmod -R 777 data && $(docker_compose_cmd) up -d
-    show_credentials "$wd"
+    info "恢复完成。"
 }
 
 setup_auto_backup() {
@@ -260,7 +215,7 @@ main_menu() {
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
-    echo "  2) 升级服务1"
+    echo "  2) 升级服务"
     echo "  3) 停止服务"
     echo "  4) 重启服务"
     echo "  5) 手动备份"
