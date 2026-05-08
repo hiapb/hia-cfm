@@ -17,19 +17,31 @@ warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺失核心依赖: $1"; }
-get_local_ip() { hostname -I | awk '{print $1}' || echo "127.0.0.1"; }
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "缺失核心依赖: $1"
+}
+
+get_local_ip() {
+    hostname -I | awk '{print $1}' || echo "127.0.0.1"
+}
 
 docker_compose_cmd() {
-    if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"
-    elif docker compose version >/dev/null 2>&1; then echo "docker compose"
-    else die "未探测到 Docker Compose 引擎。"; fi
+    if command -v docker-compose >/dev/null 2>&1; then
+        echo "docker-compose"
+    elif docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    else
+        die "未探测到 Docker Compose 引擎。"
+    fi
 }
 
 get_workdir() {
     if [[ -f "$ENV_RECORD_FILE" ]]; then
         local dir=$(cat "$ENV_RECORD_FILE")
-        if [[ -d "$dir" ]]; then echo "$dir"; return; fi
+        if [[ -d "$dir" ]]; then
+            echo "$dir"
+            return
+        fi
     fi
     echo ""
 }
@@ -41,9 +53,9 @@ extract_and_show_credentials() {
     
     if [[ ! -f "$config_file" ]]; then return; fi
     
-    # 利用边界定位符精准提取，彻底无视格式变异
-    local sys_admin_pass=$(awk '/^admin:/{flag=1} flag && /password:/{print $2; flag=0}' "$config_file" | tr -d ' "\'')
-    local sys_api_key=$(awk '/^admin:/{flag=1} flag && /api_key:/{print $2; flag=0}' "$config_file" | tr -d ' "\'')
+    # 将多重字符清洗拆分为物理独立管道，彻底避开 Bash 子 Shell 的单引号转义黑洞
+    local sys_admin_pass=$(awk '/^admin:/{flag=1} flag && /password:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
+    local sys_api_key=$(awk '/^admin:/{flag=1} flag && /api_key:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
     
     local host_port=$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "8877")
     local server_ip=$(get_local_ip)
@@ -52,8 +64,8 @@ extract_and_show_credentials() {
     echo -e "\033[32m✅ CodeFreeMax 实例就绪\033[0m"
     echo -e "控制面板: \033[36mhttp://${server_ip}:${host_port}\033[0m"
     echo -e "--------------------------------------------------"
-    echo -e "面板密码: \033[31m${sys_admin_pass:-[解析失败]}\033[0m"
-    echo -e "系统 API Key: \033[33m${sys_api_key:-[解析失败]}\033[0m"
+    echo -e "面板密码: \033[31m${sys_admin_pass:-[未解析]}\033[0m"
+    echo -e "系统 API Key: \033[33m${sys_api_key:-[未解析]}\033[0m"
     echo -e "--------------------------------------------------"
     echo -e "配置根源: \033[33m${config_file}\033[0m"
     echo -e "==================================================\n"
@@ -72,7 +84,7 @@ deploy_codefreemax() {
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
     
     if [[ -d "$install_path" && -f "$install_path/docker-compose.yml" ]]; then
-        err "检测到存量实例。请先执行 [8] 完全卸载以抹除数据库残留。"
+        err "检测到存量实例。请先执行完全卸载。"
         return 
     fi
 
@@ -91,7 +103,6 @@ deploy_codefreemax() {
     local new_api_key="sk-cfm-$(openssl rand -hex 16)"
 
     info "执行高能态正则注入，切断上游预设钩子..."
-    # 采用 awk 跨平台绝对替换，锁定 admin 节点级，无视原值是 sk-paas 还是空白
     awk -v pw="${new_admin_pass}" -v ak="${new_api_key}" '
         /^admin:/ { in_admin=1; print; next }
         /^[^ ]/ { in_admin=0 }
@@ -242,7 +253,7 @@ install_ftp(){
 main_menu() {
     clear
     echo "==================================================="
-    echo "                 CodeFreeMax 管理  1                "
+    echo "                 CodeFreeMax 管理                  "
     echo "==================================================="
     local wd=$(get_workdir)
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
