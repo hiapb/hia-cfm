@@ -32,16 +32,36 @@ inject_secure_credentials() {
     local workdir=$1
     local new_pass=$2
     local new_key=$3
-    info "正在拦截初始化硬编码注入 (预计需等待 20 秒)..."
-    sleep 20
+    
+    info "启动智能嗅探，等待 system_configs 表完成实例化..."
+    local ready=0
+    # 智能轮询：最大等待 40 秒，一旦表创建立即突入
+    for i in {1..20}; do
+        docker exec -i cfm-client-mysql mysql -uroot -pcodefreemax kiro_client -e "SELECT 1 FROM system_configs LIMIT 1;" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            ready=1
+            break
+        fi
+        sleep 2
+    done
+
+    if [ $ready -eq 0 ]; then
+        warn "引擎超时未检测到目标表，注入流熔断。请检视服务器 I/O 状态。"
+        return
+    fi
+
+    # 实施全覆盖型 SQL 注入，穿透底层 ORM 字段命名迷雾
     docker exec -i cfm-client-mysql mysql -uroot -pcodefreemax kiro_client -e "
-        UPDATE options SET value='${new_pass}' WHERE \`key\`='admin_password';
-        UPDATE options SET value='${new_key}' WHERE \`key\`='system_api_key';
+        UPDATE system_configs SET value='${new_pass}' WHERE \`key\` IN ('admin_password', 'password');
+        UPDATE system_configs SET value='${new_key}' WHERE \`key\` IN ('system_api_key', 'api_key');
+        UPDATE system_configs SET \`value\`='${new_pass}' WHERE \`name\` IN ('admin_password', 'password');
+        UPDATE system_configs SET \`value\`='${new_key}' WHERE \`name\` IN ('system_api_key', 'api_key');
     " > /dev/null 2>&1
+
     if [ $? -eq 0 ]; then
-        info "数据库主权接管成功：系统后门已被物理覆盖。"
+        info "底层数据穿透成功：原始出厂硬编码已被安全密匙强制抹除。"
     else
-        warn "数据库接管失败，可能初始化未完成，请稍后通过面板手动修改。"
+        warn "数据库指令下发异常，核心主权未能完全接管。"
     fi
 }
 
@@ -60,7 +80,7 @@ show_credentials() {
     echo -e "面板密码: \033[31m${sys_admin_pass}\033[0m"
     echo -e "系统 API Key: \033[33m${sys_api_key}\033[0m"
     echo -e "--------------------------------------------------"
-    echo -e "⚠️ 系统已强制执行 SQL 注入，接管了初始鉴权凭证。"
+    echo -e "⚠️ 系统已强制执行 SQL 注入，完成商业级安全防线闭环。"
     echo -e "==================================================\n"
 }
 
@@ -240,7 +260,7 @@ main_menu() {
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
-    echo "  2) 升级服务"
+    echo "  2) 升级服务1"
     echo "  3) 停止服务"
     echo "  4) 重启服务"
     echo "  5) 手动备份"
