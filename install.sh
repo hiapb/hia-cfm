@@ -21,7 +21,6 @@ REDIS_CONTAINER="cfm-client-redis"
 
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
-err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
 require_cmd() {
@@ -200,8 +199,6 @@ LIMIT 1;
     fi
 
     info "检测到配置表: ${table}"
-    info "Key 字段: ${key_col}"
-    info "Value 字段: ${value_col}"
     info "同步密码/API Key 到数据库..."
 
     docker exec -i "$MYSQL_CONTAINER" mysql \
@@ -311,8 +308,6 @@ EOF
     inject_db_credentials || true
 
     show_credentials "$install_path"
-
-    info "如果外网打不开，请放行端口: ${host_port}"
 }
 
 upgrade_service() {
@@ -434,12 +429,18 @@ restore_backup() {
 
     [[ ! -f "$path" ]] && die "备份文件不存在"
 
+    local safe_backup="/tmp/$(basename "$path")"
+    cp "$path" "$safe_backup" || die "备份文件复制到临时目录失败"
+
     read -r -p "恢复目录 [默认: ${DEFAULT_INSTALL_PATH}]: " target_dir
     local wd=${target_dir:-$DEFAULT_INSTALL_PATH}
 
     if [[ -d "$wd" ]]; then
         read -r -p "目标目录已存在，是否覆盖？(y/N): " confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && {
+            rm -f "$safe_backup"
+            return
+        }
 
         cd "$wd" 2>/dev/null && $(docker_compose_cmd) down -v || true
         cd /
@@ -447,7 +448,9 @@ restore_backup() {
     fi
 
     mkdir -p "$wd"
-    tar -xzf "$path" -C "$wd"
+    tar -xzf "$safe_backup" -C "$wd" || die "解压备份失败"
+
+    rm -f "$safe_backup"
 
     echo "$wd" > "$ENV_RECORD_FILE"
 
@@ -459,7 +462,7 @@ restore_backup() {
 
     info "启动容器..."
 
-    $(docker_compose_cmd) up -d
+    $(docker_compose_cmd) up -d || die "容器启动失败"
 
     wait_mysql_ready || die "MySQL 启动失败"
 
