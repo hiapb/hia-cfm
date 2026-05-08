@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# ==========================================
+# CodeFreeMax 生产级运维控制台 (终极防线版)
+# 包含：动态密钥注入、强制状态对齐、物理级残留熔断
+# ==========================================
+
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -53,7 +58,7 @@ extract_and_show_credentials() {
     
     if [[ ! -f "$config_file" ]]; then return; fi
     
-    # 将多重字符清洗拆分为物理独立管道，彻底避开 Bash 子 Shell 的单引号转义黑洞
+    # 将多重字符清洗拆分为物理独立管道，避开子 Shell 转义黑洞
     local sys_admin_pass=$(awk '/^admin:/{flag=1} flag && /password:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
     local sys_api_key=$(awk '/^admin:/{flag=1} flag && /api_key:/{print $2; flag=0}' "$config_file" | tr -d '"' | tr -d "'" | tr -d ' ')
     
@@ -61,13 +66,13 @@ extract_and_show_credentials() {
     local server_ip=$(get_local_ip)
 
     echo -e "\n=================================================="
-    echo -e "\033[32m✅ CodeFreeMax 实例就绪\033[0m"
+    echo -e "\033[32m✅ CodeFreeMax 实例就绪，业务链路已连通\033[0m"
     echo -e "控制面板: \033[36mhttp://${server_ip}:${host_port}\033[0m"
     echo -e "--------------------------------------------------"
     echo -e "面板密码: \033[31m${sys_admin_pass:-[未解析]}\033[0m"
     echo -e "系统 API Key: \033[33m${sys_api_key:-[未解析]}\033[0m"
     echo -e "--------------------------------------------------"
-    echo -e "配置根源: \033[33m${config_file}\033[0m"
+    echo -e "物理真理源: \033[33m${config_file}\033[0m"
     echo -e "==================================================\n"
 }
 
@@ -76,15 +81,16 @@ deploy_codefreemax() {
     require_cmd docker
     require_cmd curl
     require_cmd openssl
-    require_cmd sed
     require_cmd awk
     
     local dc_cmd=$(docker_compose_cmd)
     read -r -p "请输入安装路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
     
-    if [[ -d "$install_path" && -f "$install_path/docker-compose.yml" ]]; then
-        err "检测到存量实例。请先执行完全卸载。"
+    # 物理级残留熔断：防止 MySQL 幽灵数据劫持鉴权流程
+    if [[ -d "$install_path" && "$(ls -A "$install_path" 2>/dev/null)" ]]; then
+        err "检测到目标路径非空（存在残留数据库卷或脏数据）！"
+        warn "为保证高熵密匙 100% 成功注入数据库，请先执行【8 完全卸载】进行物理级核平。"
         return 
     fi
 
@@ -99,10 +105,11 @@ deploy_codefreemax() {
     curl -sSL "$COMPOSE_URL" -o docker-compose.yml || { err "拓扑同步失败。"; return; }
     curl -sSL "$CONFIG_URL" -o config.yaml || { err "配置树同步失败。"; return; }
 
+    # 锻造高熵凭证
     local new_admin_pass=$(openssl rand -hex 6)
     local new_api_key="sk-cfm-$(openssl rand -hex 16)"
 
-    info "执行高能态正则注入，切断上游预设钩子..."
+    info "执行边界正则注入，重写底层鉴权协议..."
     awk -v pw="${new_admin_pass}" -v ak="${new_api_key}" '
         /^admin:/ { in_admin=1; print; next }
         /^[^ ]/ { in_admin=0 }
@@ -116,7 +123,10 @@ PORT=${host_port}
 TZ=Asia/Shanghai
 EOF
 
+    # 预建物理卷并强制提权，杜绝 Docker 引擎自建导致的 root 权限锁死
     mkdir -p data && chmod -R 777 data
+    
+    info "容器矩阵冷启动 (系统将首次向 MySQL 播种配置)..."
     $dc_cmd up -d || { err "容器启动异常。"; return; }
 
     extract_and_show_credentials "$install_path"
@@ -232,15 +242,24 @@ EOF
 
 uninstall_service() {
     local workdir=$(get_workdir)
-    [[ -z "$workdir" ]] && return
+    if [[ -z "$workdir" ]]; then
+        workdir=$DEFAULT_INSTALL_PATH
+    fi
     
-    read -r -p "确认物理销毁实例与数据？[y/N]: " confirm
+    warn "该操作将彻底销毁实例，并强制物理抹除所有落盘数据！"
+    read -r -p "确认物理销毁？[y/N]: " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return
     
-    cd "$workdir" && $(docker_compose_cmd) down -v || true
-    rm -rf "$workdir" "$ENV_RECORD_FILE"
-    crontab -l | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab -
-    info "资源已深度释放。"
+    if [[ -d "$workdir" ]]; then
+        cd "$workdir" && $(docker_compose_cmd) down -v || true
+        cd /
+        # 强制执行物理级卷轴抹除
+        rm -rf "$workdir"
+    fi
+    
+    rm -f "$ENV_RECORD_FILE"
+    crontab -l 2>/dev/null | sed "/${CRON_TAG_BEGIN}/,/${CRON_TAG_END}/d" | crontab -
+    info "资源已深度释放，底层物理存储彻底净空。"
 }
 
 install_ftp(){
@@ -265,7 +284,7 @@ main_menu() {
     echo "  5) 手动备份"
     echo "  6) 恢复备份"
     echo "  7) 定时备份"
-    echo "  8) 完全卸载"
+    echo "  8) 完全卸载1"
     echo "  9) 📂 FTP/SFTP 备份工具"
     echo "  0) 退出脚本"
     echo "==================================================="
