@@ -3,6 +3,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 DEFAULT_INSTALL_PATH="/opt/codefreemax"
+
 COMPOSE_URL="https://raw.githubusercontent.com/ssmDo/CodeFreeMax/main/docker-compose.yml"
 CONFIG_URL="https://raw.githubusercontent.com/ssmDo/CodeFreeMax/main/config.yaml"
 
@@ -129,6 +130,7 @@ wait_app_ready() {
     done
 
     warn "CodeFreeMax 可能未正常启动"
+    docker logs --tail=80 codefreemax 2>/dev/null || true
     return 1
 }
 
@@ -136,25 +138,70 @@ inject_db_credentials() {
     info "等待业务配置表初始化..."
 
     local table=""
+    local key_col=""
+    local value_col=""
 
-    for i in {1..60}; do
+    for i in {1..90}; do
         table=$(docker exec "$MYSQL_CONTAINER" mysql \
             -u"$MYSQL_USER" \
             -p"$MYSQL_PASS" \
             -N -B "$MYSQL_DB" \
-            -e "SHOW TABLES LIKE '%config%';" 2>/dev/null | head -n 1 || true)
+            -e "
+SELECT c1.TABLE_NAME
+FROM information_schema.COLUMNS c1
+JOIN information_schema.COLUMNS c2
+  ON c1.TABLE_SCHEMA=c2.TABLE_SCHEMA
+ AND c1.TABLE_NAME=c2.TABLE_NAME
+WHERE c1.TABLE_SCHEMA='${MYSQL_DB}'
+  AND c1.COLUMN_NAME IN ('key','name','config_key')
+  AND c2.COLUMN_NAME IN ('value','config_value')
+LIMIT 1;
+" 2>/dev/null | head -n 1 || true)
 
         [[ -n "$table" ]] && break
-
         sleep 2
     done
 
     if [[ -z "$table" ]]; then
-        warn "未检测到配置表，跳过数据库凭据同步"
+        warn "未找到真正的系统配置表，跳过数据库同步。"
+        warn "密码/API Key 已写入 config.yaml。"
         return 1
     fi
 
-    info "检测到配置表: $table"
+    key_col=$(docker exec "$MYSQL_CONTAINER" mysql \
+        -u"$MYSQL_USER" \
+        -p"$MYSQL_PASS" \
+        -N -B "$MYSQL_DB" \
+        -e "
+SELECT COLUMN_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA='${MYSQL_DB}'
+  AND TABLE_NAME='${table}'
+  AND COLUMN_NAME IN ('key','name','config_key')
+LIMIT 1;
+" 2>/dev/null | head -n 1)
+
+    value_col=$(docker exec "$MYSQL_CONTAINER" mysql \
+        -u"$MYSQL_USER" \
+        -p"$MYSQL_PASS" \
+        -N -B "$MYSQL_DB" \
+        -e "
+SELECT COLUMN_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA='${MYSQL_DB}'
+  AND TABLE_NAME='${table}'
+  AND COLUMN_NAME IN ('value','config_value')
+LIMIT 1;
+" 2>/dev/null | head -n 1)
+
+    if [[ -z "$key_col" || -z "$value_col" ]]; then
+        warn "配置表字段识别失败，跳过数据库同步。"
+        return 1
+    fi
+
+    info "检测到配置表: ${table}"
+    info "Key 字段: ${key_col}"
+    info "Value 字段: ${value_col}"
     info "同步密码/API Key 到数据库..."
 
     docker exec -i "$MYSQL_CONTAINER" mysql \
@@ -162,20 +209,23 @@ inject_db_credentials() {
         -p"$MYSQL_PASS" \
         "$MYSQL_DB" <<EOF
 UPDATE \`${table}\`
-SET value='${SYS_PASS}'
-WHERE \`key\` IN ('admin_password','password','system_password');
+SET \`${value_col}\`='${SYS_PASS}'
+WHERE \`${key_col}\` IN (
+    'admin_password',
+    'password',
+    'system_password',
+    'admin.pass',
+    'admin_password_hash'
+);
 
 UPDATE \`${table}\`
-SET value='${SYS_KEY}'
-WHERE \`key\` IN ('system_api_key','api_key','apikey');
-
-UPDATE \`${table}\`
-SET value='${SYS_PASS}'
-WHERE \`name\` IN ('admin_password','password','system_password');
-
-UPDATE \`${table}\`
-SET value='${SYS_KEY}'
-WHERE \`name\` IN ('system_api_key','api_key','apikey');
+SET \`${value_col}\`='${SYS_KEY}'
+WHERE \`${key_col}\` IN (
+    'system_api_key',
+    'api_key',
+    'apikey',
+    'system.key'
+);
 EOF
 
     if [[ $? -eq 0 ]]; then
@@ -533,9 +583,9 @@ show_status() {
 
     cd "$workdir" || exit 1
 
-    docker compose ps 2>/dev/null || docker-compose ps
+    $(docker_compose_cmd) ps
     echo ""
-    ss -tlnp 2>/dev/null | grep -E '8877|63376|codefreemax' || true
+    docker logs --tail=80 codefreemax 2>/dev/null || true
 }
 
 main_menu() {
