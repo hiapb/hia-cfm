@@ -22,9 +22,7 @@ warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err()  { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die()  { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "系统缺少核心依赖: $1"
-}
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "系统缺少核心依赖: $1"; }
 
 get_local_ip() {
     hostname -I | awk '{print $1}' || echo "127.0.0.1"
@@ -154,15 +152,8 @@ wait_app_ready() {
     return 1
 }
 
-inject_db_credentials() {
-    info "等待业务配置表初始化..."
-
-    local table=""
-    local key_col=""
-    local value_col=""
-
-    for i in {1..90}; do
-        table=$(mysql_exec_query "
+detect_config_table() {
+    mysql_exec_query "
 SELECT c1.TABLE_NAME
 FROM information_schema.COLUMNS c1
 JOIN information_schema.COLUMNS c2
@@ -171,36 +162,74 @@ JOIN information_schema.COLUMNS c2
 WHERE c1.TABLE_SCHEMA='${MYSQL_DB}'
   AND c1.COLUMN_NAME IN ('key','name','config_key')
   AND c2.COLUMN_NAME IN ('value','config_value')
+ORDER BY
+  CASE
+    WHEN c1.TABLE_NAME='system_configs' THEN 0
+    WHEN c1.TABLE_NAME LIKE '%system%config%' THEN 1
+    WHEN c1.TABLE_NAME LIKE '%config%' THEN 2
+    ELSE 9
+  END
 LIMIT 1;
-" 2>/dev/null | head -n 1 || true)
+" 2>/dev/null | head -n 1 || true
+}
 
-        [[ -n "$table" ]] && break
-        sleep 2
-    done
-
-    if [[ -z "$table" ]]; then
-        warn "未找到真正的系统配置表，跳过数据库同步。"
-        warn "密码/API Key 已写入 config.yaml。"
-        return 1
-    fi
-
-    key_col=$(mysql_exec_query "
+detect_key_col() {
+    local table="$1"
+    mysql_exec_query "
 SELECT COLUMN_NAME
 FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA='${MYSQL_DB}'
   AND TABLE_NAME='${table}'
   AND COLUMN_NAME IN ('key','name','config_key')
+ORDER BY
+  CASE
+    WHEN COLUMN_NAME='key' THEN 0
+    WHEN COLUMN_NAME='name' THEN 1
+    WHEN COLUMN_NAME='config_key' THEN 2
+    ELSE 9
+  END
 LIMIT 1;
-" 2>/dev/null | head -n 1)
+" 2>/dev/null | head -n 1 || true
+}
 
-    value_col=$(mysql_exec_query "
+detect_value_col() {
+    local table="$1"
+    mysql_exec_query "
 SELECT COLUMN_NAME
 FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA='${MYSQL_DB}'
   AND TABLE_NAME='${table}'
   AND COLUMN_NAME IN ('value','config_value')
+ORDER BY
+  CASE
+    WHEN COLUMN_NAME='value' THEN 0
+    WHEN COLUMN_NAME='config_value' THEN 1
+    ELSE 9
+  END
 LIMIT 1;
-" 2>/dev/null | head -n 1)
+" 2>/dev/null | head -n 1 || true
+}
+
+inject_db_credentials() {
+    info "等待业务配置表初始化..."
+
+    local table=""
+    local key_col=""
+    local value_col=""
+
+    for i in {1..90}; do
+        table=$(detect_config_table)
+        [[ -n "$table" ]] && break
+        sleep 2
+    done
+
+    if [[ -z "$table" ]]; then
+        warn "未找到系统配置表，跳过数据库同步。"
+        return 1
+    fi
+
+    key_col=$(detect_key_col "$table")
+    value_col=$(detect_value_col "$table")
 
     if [[ -z "$key_col" || -z "$value_col" ]]; then
         warn "配置表字段识别失败，跳过数据库同步。"
@@ -213,40 +242,108 @@ LIMIT 1;
     mysql_exec <<EOF
 UPDATE \`${table}\`
 SET \`${value_col}\`='${SYS_PASS}'
-WHERE \`${key_col}\` IN (
+WHERE LOWER(\`${key_col}\`) IN (
     'admin_password',
     'password',
     'system_password',
     'admin.pass',
     'admin_password_hash'
-);
+)
+OR LOWER(\`${key_col}\`) LIKE '%admin%password%'
+OR LOWER(\`${key_col}\`) LIKE '%admin%pass%';
 
 UPDATE \`${table}\`
 SET \`${value_col}\`='${SYS_KEY}'
-WHERE \`${key_col}\` IN (
+WHERE LOWER(\`${key_col}\`) IN (
     'system_api_key',
     'api_key',
     'apikey',
-    'system.key'
-);
+    'system.key',
+    'admin_api_key'
+)
+OR LOWER(\`${key_col}\`) LIKE '%api%key%'
+OR LOWER(\`${key_col}\`) LIKE '%apikey%';
 EOF
 
-    if [[ $? -eq 0 ]]; then
-        info "数据库凭据同步完成"
-    else
-        warn "数据库凭据同步失败"
-        return 1
-    fi
+    info "数据库凭据同步完成"
+
+    return 0
+}
+
+read_credentials_from_db() {
+    local table
+    local key_col
+    local value_col
+
+    table=$(detect_config_table)
+    [[ -z "$table" ]] && return 1
+
+    key_col=$(detect_key_col "$table")
+    value_col=$(detect_value_col "$table")
+
+    [[ -z "$key_col" || -z "$value_col" ]] && return 1
+
+    DB_PASS=$(mysql_exec_query "
+SELECT \`${value_col}\`
+FROM \`${table}\`
+WHERE LOWER(\`${key_col}\`) IN (
+    'admin_password',
+    'password',
+    'system_password',
+    'admin.pass',
+    'admin_password_hash'
+)
+OR LOWER(\`${key_col}\`) LIKE '%admin%password%'
+OR LOWER(\`${key_col}\`) LIKE '%admin%pass%'
+ORDER BY
+  CASE
+    WHEN LOWER(\`${key_col}\`)='admin_password' THEN 0
+    WHEN LOWER(\`${key_col}\`)='password' THEN 1
+    ELSE 9
+  END
+LIMIT 1;
+" 2>/dev/null | head -n 1 || true)
+
+    DB_KEY=$(mysql_exec_query "
+SELECT \`${value_col}\`
+FROM \`${table}\`
+WHERE LOWER(\`${key_col}\`) IN (
+    'system_api_key',
+    'api_key',
+    'apikey',
+    'system.key',
+    'admin_api_key'
+)
+OR LOWER(\`${key_col}\`) LIKE '%api%key%'
+OR LOWER(\`${key_col}\`) LIKE '%apikey%'
+ORDER BY
+  CASE
+    WHEN LOWER(\`${key_col}\`)='system_api_key' THEN 0
+    WHEN LOWER(\`${key_col}\`)='api_key' THEN 1
+    ELSE 9
+  END
+LIMIT 1;
+" 2>/dev/null | head -n 1 || true)
+
+    [[ -n "$DB_PASS" || -n "$DB_KEY" ]]
 }
 
 show_credentials() {
     local workdir="$1"
     local env_file="${workdir}/.env"
 
-    read_credentials_from_config "${workdir}/config.yaml"
-
     local host_port
     host_port=$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "8877")
+
+    DB_PASS=""
+    DB_KEY=""
+
+    read_credentials_from_db || true
+
+    [[ -z "$DB_PASS" || -z "$DB_KEY" ]] && read_credentials_from_config "${workdir}/config.yaml"
+
+    [[ -n "$DB_PASS" ]] && SYS_PASS="$DB_PASS"
+    [[ -n "$DB_KEY" ]] && SYS_KEY="$DB_KEY"
 
     echo ""
     echo "=================================================="
@@ -254,8 +351,8 @@ show_credentials() {
     echo "--------------------------------------------------"
     echo -e "控制面板: \033[36mhttp://$(get_local_ip):${host_port}\033[0m"
     echo "--------------------------------------------------"
-    echo -e "面板密码: \033[31m${SYS_PASS}\033[0m"
-    echo -e "系统 API Key: \033[33m${SYS_KEY}\033[0m"
+    echo -e "面板密码: \033[31m${SYS_PASS:-未能读取}\033[0m"
+    echo -e "系统 API Key: \033[33m${SYS_KEY:-未能读取}\033[0m"
     echo "=================================================="
     echo ""
 }
@@ -267,11 +364,18 @@ show_access_only() {
     local host_port
     host_port=$(grep -oP '^PORT=\K.*' "$env_file" 2>/dev/null || echo "8877")
 
+    DB_PASS=""
+    DB_KEY=""
+    read_credentials_from_db || true
+
     echo ""
     echo "=================================================="
     echo -e "\033[32m✅ CodeFreeMax 服务已就绪\033[0m"
     echo "--------------------------------------------------"
     echo -e "控制面板: \033[36mhttp://$(get_local_ip):${host_port}\033[0m"
+    echo "--------------------------------------------------"
+    echo -e "当前数据库面板密码: \033[31m${DB_PASS:-未能读取}\033[0m"
+    echo -e "当前数据库 API Key: \033[33m${DB_KEY:-未能读取}\033[0m"
     echo "=================================================="
     echo ""
 }
@@ -328,11 +432,18 @@ EOF
 
     wait_mysql_ready || die "MySQL 初始化失败"
 
-    sleep 10
+    sleep 15
 
     wait_app_ready || true
 
     inject_db_credentials || true
+
+    info "重启业务容器使凭据生效..."
+    $dc_cmd restart codefreemax >/dev/null 2>&1 || true
+
+    sleep 8
+
+    wait_app_ready || true
 
     show_credentials "$install_path"
 }
@@ -638,22 +749,6 @@ install_ftp(){
     bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
     sleep 2
     exit 0
-}
-
-show_status() {
-    local workdir
-    workdir=$(get_workdir)
-
-    [[ -z "$workdir" ]] && {
-        err "未检测到部署环境。"
-        return
-    }
-
-    cd "$workdir" || return
-
-    $(docker_compose_cmd) ps
-    echo ""
-    docker logs --tail=80 codefreemax 2>/dev/null || true
 }
 
 main_menu() {
